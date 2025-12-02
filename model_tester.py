@@ -99,8 +99,9 @@ class ZoomableGraphicsView(QGraphicsView):
         self._max_cache = 30  # 최대 30개 캐싱
     
     def set_image(self, image_path):
-        """이미지 로드 및 표시 (동기 방식으로 변경 - 안정성)"""
+        """이미지 로드 및 표시 (동기 방식 - 한글 경로 지원)"""
         if not image_path or not os.path.exists(image_path):
+            print(f"파일 없음: {image_path}")
             return False
         
         self._current_path = image_path
@@ -114,9 +115,12 @@ class ZoomableGraphicsView(QGraphicsView):
             self._cache_order.append(image_path)
             return True
         
-        # 동기 로드 (안정성 우선)
+        # 동기 로드 (한글 경로 지원)
         try:
-            img = cv2.imread(image_path)
+            # 한글 경로 지원을 위해 numpy로 로드
+            img_array = np.fromfile(image_path, dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
             if img is None:
                 print(f"이미지 로드 실패: {image_path}")
                 return False
@@ -130,11 +134,19 @@ class ZoomableGraphicsView(QGraphicsView):
             
             # BGR to RGB
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # 연속된 메모리로 복사 (QImage 안정성)
+            img = np.ascontiguousarray(img)
             h, w, ch = img.shape
+            bytes_per_line = ch * w
             
             # QPixmap으로 변환
-            qimg = QImage(img.data, w, h, ch * w, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qimg.copy())
+            qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())  # copy() 중요
+            
+            if pixmap.isNull():
+                print(f"QPixmap 변환 실패: {image_path}")
+                return False
             
             # 캐시에 저장
             self._image_cache[image_path] = pixmap
@@ -151,6 +163,8 @@ class ZoomableGraphicsView(QGraphicsView):
             
         except Exception as e:
             print(f"이미지 로드 오류: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def _on_image_loaded(self, pixmap, filepath):
@@ -344,8 +358,13 @@ class InferenceThread(QThread):
                             
                             # 10장마다 미리보기 업데이트 (이미지 포함)
                             if processed % preview_interval == 0:
-                                # 미리보기용 이미지 로드 (RGB)
-                                preview_img = cv2.imread(str(img_path))
+                                # 미리보기용 이미지 로드 (한글 경로 지원)
+                                try:
+                                    img_array = np.fromfile(str(img_path), dtype=np.uint8)
+                                    preview_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                                except:
+                                    preview_img = None
+                                    
                                 if preview_img is not None:
                                     # 큰 이미지 리사이즈
                                     h, w = preview_img.shape[:2]
@@ -1062,27 +1081,39 @@ class ModelTestGUI(QMainWindow):
     
     def on_preview(self, image_array, filepath, predicted_class, confidence):
         """미리보기 업데이트 (10장마다 호출) - 이미지 직접 표시"""
-        # numpy array를 QPixmap으로 변환하여 직접 표시
-        h, w, ch = image_array.shape
-        qimg = QImage(image_array.data, w, h, ch * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg.copy())
-        
-        # 이미지 뷰어에 직접 표시
-        self.image_viewer._scene.clear()
-        self.image_viewer._pixmap_item = QGraphicsPixmapItem(pixmap)
-        self.image_viewer._scene.addItem(self.image_viewer._pixmap_item)
-        self.image_viewer._scene.setSceneRect(QRectF(pixmap.rect()))
-        self.image_viewer.fit_in_view()
-        
-        # 파일명 표시
-        filename = Path(filepath).name
-        self.file_info_label.setText(f"미리보기: {filename}")
-        
-        # 예측 결과 표시
-        class_colors = {"Normal": "#4caf50", "Twist": "#ff9800", "Hook": "#f44336"}
-        color = class_colors.get(predicted_class, "#4a9eff")
-        self.prediction_label.setText(f"예측: {predicted_class} ({confidence*100:.1f}%)")
-        self.prediction_label.setStyleSheet(f"QLabel {{ color: {color}; padding: 10px; background-color: #2a2a2a; border-radius: 5px; font-size: 16pt; }}")
+        try:
+            # numpy array를 QPixmap으로 변환하여 직접 표시
+            # 연속된 메모리로 복사 (중요!)
+            img = np.ascontiguousarray(image_array)
+            h, w, ch = img.shape
+            bytes_per_line = ch * w
+            
+            qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())  # copy() 중요: 메모리 안전
+            
+            if pixmap.isNull():
+                print(f"미리보기 변환 실패: {filepath}")
+                return
+            
+            # 이미지 뷰어에 직접 표시
+            self.image_viewer._scene.clear()
+            self.image_viewer._pixmap_item = QGraphicsPixmapItem(pixmap)
+            self.image_viewer._scene.addItem(self.image_viewer._pixmap_item)
+            self.image_viewer._scene.setSceneRect(QRectF(pixmap.rect()))
+            self.image_viewer.fit_in_view()
+            
+            # 파일명 표시
+            filename = Path(filepath).name
+            self.file_info_label.setText(f"미리보기: {filename}")
+            
+            # 예측 결과 표시
+            class_colors = {"Normal": "#4caf50", "Twist": "#ff9800", "Hook": "#f44336"}
+            color = class_colors.get(predicted_class, "#4a9eff")
+            self.prediction_label.setText(f"예측: {predicted_class} ({confidence*100:.1f}%)")
+            self.prediction_label.setStyleSheet(f"QLabel {{ color: {color}; padding: 10px; background-color: #2a2a2a; border-radius: 5px; font-size: 16pt; }}")
+            
+        except Exception as e:
+            print(f"미리보기 표시 오류: {e}")
     
     def on_finished(self, elapsed_time, total_images, all_results):
         """추론 완료 - 결과 리스트 일괄 생성"""
