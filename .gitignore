@@ -1,0 +1,34 @@
+# 모델 파일 (용량 큼)
+models/
+*.net
+
+# 출력 폴더 (이미지 데이터)
+output/
+tracking_results/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# 테스트/IDE
+.pytest_cache/
+.vscode/
+*.pyc
+
+# 임시 파일
+*.log
+*.tmp
+*.temp
+
+# 상태 저장 파일
+last_position.json
+sampling_history.json
+
+# 데이터 파일 (필요시 포함)
+# layers.json
+# Layer region.xlsx
