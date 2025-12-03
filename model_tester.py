@@ -410,6 +410,81 @@ class HeatmapThread(QThread):
         self.model_path = model_path
         self.image_path = image_path
         self.use_gpu = use_gpu
+    
+    def run(self):
+        try:
+            device_idx = 0 if self.use_gpu else -1
+            
+            # CAM 출력 활성화된 Predictor 생성
+            if device_idx >= 0:
+                predictor = nrt.Predictor(
+                    str(self.model_path),
+                    nrt.Model.MODELIO_OUT_CAM,  # CAM 출력 활성화
+                    device_idx,
+                    1,  # batch_size = 1
+                    False,
+                    False,
+                    nrt.DEVICE_CUDA_GPU
+                )
+            else:
+                predictor = nrt.Predictor(
+                    str(self.model_path),
+                    nrt.Model.MODELIO_OUT_CAM,
+                    device_idx,
+                    1,
+                    False,
+                    False
+                )
+            
+            if predictor.get_status() != nrt.STATUS_SUCCESS:
+                raise Exception("Predictor 초기화 실패: " + nrt.get_last_error_msg())
+            
+            # 입력 이미지
+            inputs = nrt.Input()
+            status = inputs.extend(str(self.image_path))
+            if status != nrt.STATUS_SUCCESS:
+                raise Exception("입력 이미지 로드 실패")
+            
+            # 추론 (CAM 포함)
+            results = predictor.predict(inputs)
+            
+            if results.get_status() != nrt.STATUS_SUCCESS:
+                raise Exception("추론 실패: " + nrt.get_last_error_msg())
+            
+            # CAM 추출
+            if not results.cams.empty():
+                cam = results.cams.get(0)
+                mat_cam = cam.cam_to_numpy()
+                mat_cam = mat_cam.reshape([cam.get_height(), cam.get_width(), 3])
+                
+                # 원본 이미지 로드 (한글 경로 지원)
+                try:
+                    img_array = np.fromfile(str(self.image_path), dtype=np.uint8)
+                    original = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                except:
+                    original = None
+                    
+                if original is not None:
+                    # CAM을 원본 크기로 리사이즈
+                    cam_resized = cv2.resize(mat_cam, (original.shape[1], original.shape[0]))
+                    
+                    # 원본 이미지와 히트맵 블렌딩
+                    blended = cv2.addWeighted(original, 0.6, cam_resized, 0.4, 0)
+                    
+                    # BGR to RGB + 연속 메모리로 복사
+                    blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+                    blended = np.ascontiguousarray(blended)
+                    
+                    self.finished.emit(blended.copy(), str(self.image_path))
+                else:
+                    # CAM만 RGB로 변환 후 전송
+                    mat_cam_rgb = cv2.cvtColor(mat_cam, cv2.COLOR_BGR2RGB)
+                    self.finished.emit(np.ascontiguousarray(mat_cam_rgb).copy(), str(self.image_path))
+            else:
+                raise Exception("CAM 데이터가 없습니다. 모델이 CAM을 지원하지 않을 수 있습니다.")
+                
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class MultiHeatmapThread(QThread):
@@ -523,81 +598,6 @@ class MultiHeatmapThread(QThread):
             
         except Exception as e:
             self.error.emit(str(e), "")
-    
-    def run(self):
-        try:
-            device_idx = 0 if self.use_gpu else -1
-            
-            # CAM 출력 활성화된 Predictor 생성
-            if device_idx >= 0:
-                predictor = nrt.Predictor(
-                    str(self.model_path),
-                    nrt.Model.MODELIO_OUT_CAM,  # CAM 출력 활성화
-                    device_idx,
-                    1,  # batch_size = 1
-                    False,
-                    False,
-                    nrt.DEVICE_CUDA_GPU
-                )
-            else:
-                predictor = nrt.Predictor(
-                    str(self.model_path),
-                    nrt.Model.MODELIO_OUT_CAM,
-                    device_idx,
-                    1,
-                    False,
-                    False
-                )
-            
-            if predictor.get_status() != nrt.STATUS_SUCCESS:
-                raise Exception("Predictor 초기화 실패: " + nrt.get_last_error_msg())
-            
-            # 입력 이미지
-            inputs = nrt.Input()
-            status = inputs.extend(str(self.image_path))
-            if status != nrt.STATUS_SUCCESS:
-                raise Exception("입력 이미지 로드 실패")
-            
-            # 추론 (CAM 포함)
-            results = predictor.predict(inputs)
-            
-            if results.get_status() != nrt.STATUS_SUCCESS:
-                raise Exception("추론 실패: " + nrt.get_last_error_msg())
-            
-            # CAM 추출
-            if not results.cams.empty():
-                cam = results.cams.get(0)
-                mat_cam = cam.cam_to_numpy()
-                mat_cam = mat_cam.reshape([cam.get_height(), cam.get_width(), 3])
-                
-                # 원본 이미지 로드 (한글 경로 지원)
-                try:
-                    img_array = np.fromfile(str(self.image_path), dtype=np.uint8)
-                    original = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                except:
-                    original = None
-                    
-                if original is not None:
-                    # CAM을 원본 크기로 리사이즈
-                    cam_resized = cv2.resize(mat_cam, (original.shape[1], original.shape[0]))
-                    
-                    # 원본 이미지와 히트맵 블렌딩
-                    blended = cv2.addWeighted(original, 0.6, cam_resized, 0.4, 0)
-                    
-                    # BGR to RGB + 연속 메모리로 복사
-                    blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
-                    blended = np.ascontiguousarray(blended)
-                    
-                    self.finished.emit(blended.copy(), str(self.image_path))
-                else:
-                    # CAM만 RGB로 변환 후 전송
-                    mat_cam_rgb = cv2.cvtColor(mat_cam, cv2.COLOR_BGR2RGB)
-                    self.finished.emit(np.ascontiguousarray(mat_cam_rgb).copy(), str(self.image_path))
-            else:
-                raise Exception("CAM 데이터가 없습니다. 모델이 CAM을 지원하지 않을 수 있습니다.")
-                
-        except Exception as e:
-            self.error.emit(str(e))
 
 
 class ModelTestGUI(QMainWindow):
@@ -630,6 +630,11 @@ class ModelTestGUI(QMainWindow):
         self.heatmap_cache = {}  # {filepath: heatmap_pixmap}
         self.heatmap_generated_set = set()  # 히트맵 생성된 파일 경로 집합
         self.showing_heatmap = False
+        
+        # 자동화 관련
+        self.automation_folders = []  # 자동화 대상 폴더 목록
+        self.automation_index = 0  # 현재 처리 중인 폴더 인덱스
+        self.is_automation_running = False
         
         self.init_ui()
         self.setup_shortcuts()
@@ -709,6 +714,24 @@ class ModelTestGUI(QMainWindow):
             }
         """)
         top_layout.addWidget(self.multi_heatmap_btn)
+        
+        # 자동화 버튼 (여러 폴더 일괄 처리)
+        self.auto_btn = QPushButton("⚡ 자동화")
+        self.auto_btn.clicked.connect(self.start_automation)
+        self.auto_btn.setToolTip("여러 폴더를 선택하여 순차적으로 추론 및 JSON 저장")
+        self.auto_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6f00;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background-color: #ff8f00;
+            }
+            QPushButton:disabled {
+                background-color: #3c3c3c;
+            }
+        """)
+        top_layout.addWidget(self.auto_btn)
         
         # 배치 사이즈 설정
         top_layout.addWidget(QLabel("배치 크기:"))
@@ -1133,8 +1156,18 @@ class ModelTestGUI(QMainWindow):
             self.model_combo.addItem("모델 없음")
             self.run_btn.setEnabled(False)
         else:
-            # 첫 번째 모델 선택
-            self.model_combo.setCurrentIndex(0)
+            # 기본 모델: 권취모델_ver02.net 선택 (없으면 첫 번째)
+            default_model = "권취모델_ver02.net"
+            default_idx = -1
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemText(i) == default_model:
+                    default_idx = i
+                    break
+            
+            if default_idx >= 0:
+                self.model_combo.setCurrentIndex(default_idx)
+            else:
+                self.model_combo.setCurrentIndex(0)
     
     def on_model_changed(self, model_name):
         """모델 선택 변경"""
@@ -1847,6 +1880,313 @@ class ModelTestGUI(QMainWindow):
                 item.setText(f"🔥 {text}")
             else:
                 item.setText(f"⬜ {text}")
+    
+    def start_automation(self):
+        """자동화 시작 - 여러 폴더 선택"""
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QListWidget, QAbstractItemView
+        
+        # 폴더 선택 다이얼로그
+        dialog = QDialog(self)
+        dialog.setWindowTitle("자동화 - 폴더 선택")
+        dialog.setMinimumSize(600, 500)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+            }
+            QLabel {
+                color: #d4d4d4;
+            }
+            QListWidget {
+                background-color: #2a2a2a;
+                border: 1px solid #3c3c3c;
+                color: #d4d4d4;
+            }
+            QListWidget::item:selected {
+                background-color: #0e639c;
+            }
+            QPushButton {
+                background-color: #0e639c;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1177bb;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 안내 레이블
+        info_label = QLabel("추론할 폴더들을 선택하세요 (Ctrl+클릭으로 다중 선택)")
+        info_label.setStyleSheet("QLabel { font-size: 12pt; padding: 10px; }")
+        layout.addWidget(info_label)
+        
+        # 폴더 추가 버튼
+        add_btn_layout = QHBoxLayout()
+        add_folder_btn = QPushButton("📁 폴더 추가")
+        add_btn_layout.addWidget(add_folder_btn)
+        add_btn_layout.addStretch()
+        
+        clear_btn = QPushButton("🗑 목록 비우기")
+        add_btn_layout.addWidget(clear_btn)
+        layout.addLayout(add_btn_layout)
+        
+        # 폴더 리스트
+        folder_list = QListWidget()
+        folder_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(folder_list)
+        
+        # 선택된 폴더 수 레이블
+        count_label = QLabel("선택된 폴더: 0개")
+        count_label.setStyleSheet("QLabel { color: #4a9eff; font-weight: bold; }")
+        layout.addWidget(count_label)
+        
+        def add_folders():
+            folders = QFileDialog.getExistingDirectory(
+                dialog, "폴더 선택",
+                str(Path(r"K:\LLM Image_Storage")),
+                QFileDialog.ShowDirsOnly
+            )
+            if folders:
+                # 이미 있는지 확인
+                existing = [folder_list.item(i).text() for i in range(folder_list.count())]
+                if folders not in existing:
+                    folder_list.addItem(folders)
+                    count_label.setText(f"선택된 폴더: {folder_list.count()}개")
+        
+        def clear_folders():
+            folder_list.clear()
+            count_label.setText("선택된 폴더: 0개")
+        
+        add_folder_btn.clicked.connect(add_folders)
+        clear_btn.clicked.connect(clear_folders)
+        
+        # 버튼 박스
+        button_box = QDialogButtonBox()
+        start_btn = button_box.addButton("▶ 자동화 시작", QDialogButtonBox.AcceptRole)
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0a7a0a;
+                padding: 10px 30px;
+                font-size: 12pt;
+            }
+            QPushButton:hover {
+                background-color: #0c9a0c;
+            }
+        """)
+        cancel_btn = button_box.addButton("취소", QDialogButtonBox.RejectRole)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            # 폴더 목록 가져오기
+            folders = [folder_list.item(i).text() for i in range(folder_list.count())]
+            
+            if not folders:
+                QMessageBox.warning(self, "경고", "처리할 폴더를 추가하세요.")
+                return
+            
+            if not self.model_path or not self.model_path.exists():
+                QMessageBox.warning(self, "경고", "모델을 선택하세요.")
+                return
+            
+            # 자동화 시작
+            self.automation_folders = folders
+            self.automation_index = 0
+            self.is_automation_running = True
+            
+            # UI 상태 변경
+            self.auto_btn.setEnabled(False)
+            self.auto_btn.setText(f"⚡ 자동화 중... (0/{len(folders)})")
+            self.run_btn.setEnabled(False)
+            
+            # 첫 번째 폴더 처리 시작
+            self.process_next_automation_folder()
+    
+    def process_next_automation_folder(self):
+        """자동화 - 다음 폴더 처리"""
+        if not self.is_automation_running:
+            return
+        
+        if self.automation_index >= len(self.automation_folders):
+            # 모든 폴더 처리 완료
+            self.finish_automation()
+            return
+        
+        folder_path = self.automation_folders[self.automation_index]
+        self.auto_btn.setText(f"⚡ 자동화 중... ({self.automation_index + 1}/{len(self.automation_folders)})")
+        
+        # 폴더 설정 및 추론 시작
+        self.image_folder = Path(folder_path)
+        self.folder_label.setText(str(self.image_folder))
+        self.folder_label.setStyleSheet("QLabel { color: #ff6f00; padding: 5px; background-color: #2a2a2a; border-radius: 3px; }")
+        
+        # 초기화
+        self.results.clear()
+        self.result_list.clear()
+        self.low_conf_list.clear()
+        self.image_viewer.clear_cache()
+        self.heatmap_cache.clear()
+        self.heatmap_generated_set.clear()
+        
+        # 추론 시작
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.stop_btn.setEnabled(True)
+        
+        self.inference_thread = InferenceThread(
+            str(self.model_path),
+            str(self.image_folder),
+            use_gpu=True,
+            batch_size=self.batch_spin.value()
+        )
+        self.inference_thread.progress.connect(self.on_progress, Qt.QueuedConnection)
+        self.inference_thread.preview.connect(self.on_preview, Qt.QueuedConnection)
+        self.inference_thread.finished.connect(self.on_automation_inference_finished, Qt.QueuedConnection)
+        self.inference_thread.error.connect(self.on_automation_error, Qt.QueuedConnection)
+        self.inference_thread.start()
+    
+    def on_automation_inference_finished(self, elapsed_time, total_images, all_results):
+        """자동화 - 추론 완료 후 자동 JSON 저장"""
+        import json
+        from datetime import datetime
+        
+        # 결과 데이터 저장 및 리스트 생성
+        self.result_list.setUpdatesEnabled(False)
+        
+        for filepath, predicted_class, confidence, all_probs in all_results:
+            self.results[filepath] = (predicted_class, confidence, all_probs)
+            
+            filename = Path(filepath).name
+            item_text = f"[{predicted_class}] {confidence*100:.1f}% - {filename}"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, filepath)
+            
+            if predicted_class == "Normal":
+                item.setForeground(QColor("#4caf50"))
+            elif predicted_class == "Twist":
+                item.setForeground(QColor("#ff9800"))
+            elif predicted_class == "Hook":
+                item.setForeground(QColor("#f44336"))
+            
+            self.result_list.addItem(item)
+        
+        self.heatmap_generated_set.clear()
+        self.result_list.setUpdatesEnabled(True)
+        
+        self.progress_bar.setVisible(False)
+        self.stop_btn.setEnabled(False)
+        
+        # 통계 업데이트
+        self.update_statistics()
+        
+        # 자동으로 JSON 저장
+        if self.results:
+            self.save_automation_json()
+        
+        # 다음 폴더 처리
+        self.automation_index += 1
+        
+        # 약간의 딜레이 후 다음 폴더 처리
+        QTimer.singleShot(500, self.process_next_automation_folder)
+    
+    def save_automation_json(self):
+        """자동화 - JSON 자동 저장 (대화상자 없이)"""
+        import json
+        from datetime import datetime
+        from collections import defaultdict
+        
+        # 저장 폴더
+        save_folder = Path(r"D:\LLM_Dataset\output\Classification Info")
+        save_folder.mkdir(parents=True, exist_ok=True)
+        
+        # 파일명: 소스 폴더 이름.json
+        folder_name = self.image_folder.name
+        save_path = save_folder / f"{folder_name}.json"
+        
+        # 중복 파일명 처리
+        counter = 1
+        original_save_path = save_path
+        while save_path.exists():
+            save_path = save_folder / f"{folder_name}_{counter}.json"
+            counter += 1
+        
+        try:
+            # 분류 결과 데이터 구성
+            classification_data = {
+                "metadata": {
+                    "created_at": datetime.now().isoformat(),
+                    "model_name": self.model_path.name if self.model_path else "unknown",
+                    "source_folder": str(self.image_folder),
+                    "total_images": len(self.results),
+                    "class_names": self.class_names
+                },
+                "statistics": {
+                    "by_class": {}
+                },
+                "images": []
+            }
+            
+            # 클래스별 통계
+            class_counts = defaultdict(int)
+            for filepath, (predicted_class, confidence, all_probs) in self.results.items():
+                class_counts[predicted_class] += 1
+            
+            for class_name, count in class_counts.items():
+                classification_data["statistics"]["by_class"][class_name] = {
+                    "count": count,
+                    "percentage": round(count / len(self.results) * 100, 2)
+                }
+            
+            # 이미지별 분류 정보
+            for filepath, (predicted_class, confidence, all_probs) in self.results.items():
+                image_info = {
+                    "filename": Path(filepath).name,
+                    "filepath": filepath,
+                    "predicted_class": predicted_class,
+                    "confidence": round(confidence, 4),
+                    "all_probabilities": {name: round(prob, 4) for name, prob in all_probs}
+                }
+                classification_data["images"].append(image_info)
+            
+            classification_data["images"].sort(key=lambda x: x["filename"])
+            
+            # JSON 저장
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(classification_data, f, ensure_ascii=False, indent=2)
+            
+            print(f"[자동화] JSON 저장 완료: {save_path.name} ({len(self.results)}개 이미지)")
+            
+        except Exception as e:
+            print(f"[자동화] JSON 저장 오류: {e}")
+    
+    def on_automation_error(self, error_msg):
+        """자동화 - 추론 오류"""
+        print(f"[자동화] 추론 오류 ({self.image_folder.name}): {error_msg}")
+        
+        # 다음 폴더로 계속 진행
+        self.automation_index += 1
+        QTimer.singleShot(500, self.process_next_automation_folder)
+    
+    def finish_automation(self):
+        """자동화 완료"""
+        self.is_automation_running = False
+        self.auto_btn.setEnabled(True)
+        self.auto_btn.setText("⚡ 자동화")
+        self.run_btn.setEnabled(True)
+        self.folder_label.setStyleSheet("QLabel { color: #4a9eff; padding: 5px; background-color: #2a2a2a; border-radius: 3px; }")
+        
+        QMessageBox.information(
+            self,
+            "자동화 완료",
+            f"자동화 처리가 완료되었습니다!\n\n"
+            f"📁 처리된 폴더: {len(self.automation_folders)}개\n"
+            f"📄 JSON 파일 저장 위치:\n"
+            f"D:\\LLM_Dataset\\output\\Classification Info\\"
+        )
 
 
 def main():
