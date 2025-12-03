@@ -19,14 +19,17 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QSplitter,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGroupBox,
-    QMessageBox, QShortcut, QFrame, QComboBox
+    QMessageBox, QShortcut, QFrame, QComboBox, QSlider, QFileDialog,
+    QCheckBox
 )
 from PyQt5.QtCore import Qt, QRectF
-from PyQt5.QtGui import QPixmap, QKeySequence, QFont, QColor, QPainter
+from PyQt5.QtGui import QPixmap, QKeySequence, QFont, QColor, QPainter, QImage
+import numpy as np
+import cv2
 
 
 class ZoomableGraphicsView(QGraphicsView):
-    """줌 및 패닝 지원 이미지 뷰어"""
+    """줌 및 패닝 지원 이미지 뷰어 (밝기 조절 포함)"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,21 +47,92 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setScene(self._scene)
         self._pixmap_item = None
         self._rotation = 0
+        self._brightness = 0  # -100 ~ 100
+        self._contrast = 0  # -100 ~ 100
+        self._auto_enhance = False  # 자동 대비 향상
+        self._original_image = None  # 원본 이미지 저장
+        self._current_path = None
     
     def set_image(self, image_path):
-        """이미지 로드 및 표시"""
+        """이미지 로드 및 표시 (한글 경로 지원)"""
         self._scene.clear()
         self._rotation = 0
+        self._current_path = image_path
         
         if image_path and os.path.exists(image_path):
-            pixmap = QPixmap(str(image_path))
-            if not pixmap.isNull():
-                self._pixmap_item = QGraphicsPixmapItem(pixmap)
-                self._scene.addItem(self._pixmap_item)
-                self._scene.setSceneRect(QRectF(pixmap.rect()))
-                self.fit_in_view()
+            # 한글 경로 지원
+            img_array = np.fromfile(image_path, dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
+            if img is not None:
+                self._original_image = img.copy()
+                self._apply_enhancements_and_display()
                 return True
         return False
+    
+    def set_brightness(self, value):
+        """밝기 설정 (-100 ~ 100)"""
+        self._brightness = value
+        if self._original_image is not None:
+            self._apply_enhancements_and_display()
+    
+    def set_contrast(self, value):
+        """대비 설정 (-100 ~ 100)"""
+        self._contrast = value
+        if self._original_image is not None:
+            self._apply_enhancements_and_display()
+    
+    def set_auto_enhance(self, enabled):
+        """자동 대비 향상 (CLAHE) 설정"""
+        self._auto_enhance = enabled
+        if self._original_image is not None:
+            self._apply_enhancements_and_display()
+    
+    def _apply_enhancements_and_display(self):
+        """밝기, 대비, 자동 향상 적용 후 이미지 표시 (원본 유지)"""
+        if self._original_image is None:
+            return
+        
+        img = self._original_image.copy()
+        
+        # 1. 자동 대비 향상 (CLAHE - Contrast Limited Adaptive Histogram Equalization)
+        if self._auto_enhance:
+            # LAB 색공간에서 L 채널에 CLAHE 적용 (더 자연스러운 결과)
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            lab = cv2.merge([l, a, b])
+            img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # 2. 대비 조절 (alpha)
+        # contrast: -100 ~ 100 → alpha: 0.5 ~ 2.0
+        if self._contrast != 0:
+            alpha = 1.0 + (self._contrast / 100.0)  # 0 ~ 2.0
+            alpha = max(0.1, min(3.0, alpha))  # 안전 범위
+            img = cv2.convertScaleAbs(img, alpha=alpha, beta=0)
+        
+        # 3. 밝기 조절 (beta)
+        if self._brightness != 0:
+            beta = self._brightness * 2.55  # -255 ~ 255 범위
+            img = cv2.convertScaleAbs(img, alpha=1.0, beta=beta)
+        
+        # BGR to RGB
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        h, w, ch = img_rgb.shape
+        bytes_per_line = ch * w
+        
+        # QImage로 변환
+        img_contiguous = np.ascontiguousarray(img_rgb)
+        qimg = QImage(img_contiguous.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg.copy())
+        
+        if not pixmap.isNull():
+            self._scene.clear()
+            self._pixmap_item = QGraphicsPixmapItem(pixmap)
+            self._scene.addItem(self._pixmap_item)
+            self._scene.setSceneRect(QRectF(pixmap.rect()))
+            self.fit_in_view()
     
     def fit_in_view(self):
         """이미지를 뷰에 맞춤"""
@@ -284,6 +358,44 @@ class ImageClassifierGUI(QMainWindow):
                 border: 1px solid #555;
                 selection-background-color: #0e639c;
             }
+            QSlider::groove:horizontal {
+                border: 1px solid #3c3c3c;
+                height: 8px;
+                background: #2a2a2a;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #0e639c;
+                border: 1px solid #0e639c;
+                width: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #1177bb;
+            }
+            QSlider::sub-page:horizontal {
+                background: #0e639c;
+                border-radius: 4px;
+            }
+            QCheckBox {
+                spacing: 5px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:unchecked {
+                border: 1px solid #555;
+                background: #2a2a2a;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                border: 1px solid #0e639c;
+                background: #0e639c;
+                border-radius: 3px;
+            }
         """)
     
     def on_left_folder_changed(self, folder_name):
@@ -328,10 +440,81 @@ class ImageClassifierGUI(QMainWindow):
         self.update_status("폴더 목록 새로고침 완료")
     
     def create_list_panel(self, list_type):
-        """리스트 패널 생성"""
+        """리스트 패널 생성 (폴더 선택 + 밝기/대비 조절 포함)"""
         panel = QGroupBox("폴더 선택 필요")
         layout = QVBoxLayout(panel)
         layout.setSpacing(5)
+        
+        # 폴더 선택 버튼
+        folder_btn = QPushButton("📁 폴더 선택...")
+        folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3c3c3c;
+                padding: 8px 15px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+            }
+        """)
+        layout.addWidget(folder_btn)
+        
+        # 밝기/대비 조절 영역
+        enhance_group = QGroupBox("🔆 이미지 보정 (뷰어 전용)")
+        enhance_layout = QVBoxLayout(enhance_group)
+        enhance_layout.setContentsMargins(5, 5, 5, 5)
+        enhance_layout.setSpacing(3)
+        
+        # 밝기 조절
+        brightness_row = QHBoxLayout()
+        brightness_row.addWidget(QLabel("밝기:"))
+        brightness_slider = QSlider(Qt.Horizontal)
+        brightness_slider.setRange(-100, 100)
+        brightness_slider.setValue(0)
+        brightness_label = QLabel("0")
+        brightness_label.setFixedWidth(30)
+        brightness_label.setAlignment(Qt.AlignCenter)
+        brightness_label.setStyleSheet("color: #ffcc00; font-weight: bold;")
+        brightness_row.addWidget(brightness_slider)
+        brightness_row.addWidget(brightness_label)
+        enhance_layout.addLayout(brightness_row)
+        
+        # 대비 조절
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(QLabel("대비:"))
+        contrast_slider = QSlider(Qt.Horizontal)
+        contrast_slider.setRange(-100, 100)
+        contrast_slider.setValue(0)
+        contrast_label = QLabel("0")
+        contrast_label.setFixedWidth(30)
+        contrast_label.setAlignment(Qt.AlignCenter)
+        contrast_label.setStyleSheet("color: #00ccff; font-weight: bold;")
+        contrast_row.addWidget(contrast_slider)
+        contrast_row.addWidget(contrast_label)
+        enhance_layout.addLayout(contrast_row)
+        
+        # 자동 향상 + 리셋 버튼
+        auto_row = QHBoxLayout()
+        auto_enhance_cb = QCheckBox("자동 대비 향상 (CLAHE)")
+        auto_enhance_cb.setStyleSheet("color: #88ff88;")
+        auto_row.addWidget(auto_enhance_cb)
+        auto_row.addStretch()
+        reset_btn = QPushButton("리셋")
+        reset_btn.setFixedWidth(50)
+        reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #555;
+                padding: 3px 8px;
+                font-size: 10px;
+            }
+            QPushButton:hover {
+                background-color: #666;
+            }
+        """)
+        auto_row.addWidget(reset_btn)
+        enhance_layout.addLayout(auto_row)
+        
+        layout.addWidget(enhance_group)
         
         # 진행 상황 레이블
         progress_label = QLabel("0 / 0")
@@ -339,9 +522,10 @@ class ImageClassifierGUI(QMainWindow):
         progress_label.setStyleSheet("QLabel { font-weight: bold; color: #4a9eff; padding: 5px; }")
         layout.addWidget(progress_label)
         
-        # 리스트 위젯
+        # 리스트 위젯 (다중 선택 지원)
         list_widget = QListWidget()
         list_widget.setFont(QFont("Consolas", 9))
+        list_widget.setSelectionMode(QListWidget.ExtendedSelection)  # Ctrl/Shift로 다중 선택
         layout.addWidget(list_widget)
         
         # 버튼 영역
@@ -366,7 +550,18 @@ class ImageClassifierGUI(QMainWindow):
             self.left_list = list_widget
             self.left_progress_label = progress_label
             self.left_move_btn = move_btn
+            self.left_brightness_slider = brightness_slider
+            self.left_brightness_label = brightness_label
+            self.left_contrast_slider = contrast_slider
+            self.left_contrast_label = contrast_label
+            self.left_auto_enhance_cb = auto_enhance_cb
+            
             list_widget.currentRowChanged.connect(self.on_left_selection_changed)
+            folder_btn.clicked.connect(lambda: self.browse_folder('left'))
+            brightness_slider.valueChanged.connect(lambda v: self.on_brightness_changed('left', v))
+            contrast_slider.valueChanged.connect(lambda v: self.on_contrast_changed('left', v))
+            auto_enhance_cb.toggled.connect(lambda v: self.on_auto_enhance_changed('left', v))
+            reset_btn.clicked.connect(lambda: self.reset_enhancements('left'))
         else:
             # Right → Left 이동 버튼
             move_btn = QPushButton("← 왼쪽으로 이동 (←)")
@@ -386,11 +581,88 @@ class ImageClassifierGUI(QMainWindow):
             self.right_list = list_widget
             self.right_progress_label = progress_label
             self.right_move_btn = move_btn
+            self.right_brightness_slider = brightness_slider
+            self.right_brightness_label = brightness_label
+            self.right_contrast_slider = contrast_slider
+            self.right_contrast_label = contrast_label
+            self.right_auto_enhance_cb = auto_enhance_cb
+            
             list_widget.currentRowChanged.connect(self.on_right_selection_changed)
+            folder_btn.clicked.connect(lambda: self.browse_folder('right'))
+            brightness_slider.valueChanged.connect(lambda v: self.on_brightness_changed('right', v))
+            contrast_slider.valueChanged.connect(lambda v: self.on_contrast_changed('right', v))
+            auto_enhance_cb.toggled.connect(lambda v: self.on_auto_enhance_changed('right', v))
+            reset_btn.clicked.connect(lambda: self.reset_enhancements('right'))
         
         layout.addLayout(btn_layout)
         
         return panel
+    
+    def browse_folder(self, side):
+        """폴더 찾아보기 다이얼로그"""
+        folder = QFileDialog.getExistingDirectory(
+            self, f"{'왼쪽' if side == 'left' else '오른쪽'} 폴더 선택",
+            str(self.base_path)
+        )
+        if folder:
+            folder_path = Path(folder)
+            
+            if side == 'left':
+                self.left_folder = folder_path
+                self.left_panel.setTitle(folder_path.name)
+                # 콤보박스 동기화 (가능한 경우)
+                if folder_path.name in self.available_folders:
+                    self.left_combo.blockSignals(True)
+                    self.left_combo.setCurrentText(folder_path.name)
+                    self.left_combo.blockSignals(False)
+            else:
+                self.right_folder = folder_path
+                self.right_panel.setTitle(folder_path.name)
+                # 콤보박스 동기화 (가능한 경우)
+                if folder_path.name in self.available_folders:
+                    self.right_combo.blockSignals(True)
+                    self.right_combo.setCurrentText(folder_path.name)
+                    self.right_combo.blockSignals(False)
+            
+            self.load_images()
+            self.update_status(f"폴더 선택됨: {folder_path.name}")
+    
+    def on_brightness_changed(self, side, value):
+        """밝기 슬라이더 변경"""
+        if side == 'left':
+            self.left_brightness_label.setText(str(value))
+        else:
+            self.right_brightness_label.setText(str(value))
+        
+        # 현재 보고 있는 이미지가 해당 side의 것인 경우에만 적용
+        if self.current_source == side:
+            self.image_viewer.set_brightness(value)
+    
+    def on_contrast_changed(self, side, value):
+        """대비 슬라이더 변경"""
+        if side == 'left':
+            self.left_contrast_label.setText(str(value))
+        else:
+            self.right_contrast_label.setText(str(value))
+        
+        if self.current_source == side:
+            self.image_viewer.set_contrast(value)
+    
+    def on_auto_enhance_changed(self, side, enabled):
+        """자동 대비 향상 체크박스 변경"""
+        if self.current_source == side:
+            self.image_viewer.set_auto_enhance(enabled)
+    
+    def reset_enhancements(self, side):
+        """밝기/대비/자동향상 모두 리셋"""
+        if side == 'left':
+            self.left_brightness_slider.setValue(0)
+            self.left_contrast_slider.setValue(0)
+            self.left_auto_enhance_cb.setChecked(False)
+        else:
+            self.right_brightness_slider.setValue(0)
+            self.right_contrast_slider.setValue(0)
+            self.right_auto_enhance_cb.setChecked(False)
     
     def create_center_panel(self):
         """중앙 이미지 뷰어 패널"""
@@ -573,6 +845,12 @@ class ImageClassifierGUI(QMainWindow):
             self.current_index = row
             self.display_image(self.left_images[row])
             
+            # 밝기/대비/자동향상 적용
+            self.image_viewer._brightness = self.left_brightness_slider.value()
+            self.image_viewer._contrast = self.left_contrast_slider.value()
+            self.image_viewer._auto_enhance = self.left_auto_enhance_cb.isChecked()
+            self.image_viewer._apply_enhancements_and_display()
+            
             # 진행 표시 업데이트
             self.left_progress_label.setText(f"{row+1} / {len(self.left_images)}")
             self.left_progress_label.setStyleSheet("QLabel { font-weight: bold; color: #4a9eff; padding: 5px; }")
@@ -590,6 +868,12 @@ class ImageClassifierGUI(QMainWindow):
             self.current_source = 'right'
             self.current_index = row
             self.display_image(self.right_images[row])
+            
+            # 밝기/대비/자동향상 적용
+            self.image_viewer._brightness = self.right_brightness_slider.value()
+            self.image_viewer._contrast = self.right_contrast_slider.value()
+            self.image_viewer._auto_enhance = self.right_auto_enhance_cb.isChecked()
+            self.image_viewer._apply_enhancements_and_display()
             
             # 진행 표시 업데이트
             self.right_progress_label.setText(f"{row+1} / {len(self.right_images)}")
@@ -753,44 +1037,69 @@ class ImageClassifierGUI(QMainWindow):
             self.undo_btn.setText("↩ 실행취소 (Ctrl+Z)")
     
     def delete_selected(self):
-        """선택된 이미지 삭제"""
-        if not self.current_source or self.current_index < 0:
+        """선택된 이미지 삭제 (다중 선택 지원)"""
+        # 왼쪽 또는 오른쪽 리스트에서 선택된 항목 확인
+        left_selected = self.left_list.selectedItems()
+        right_selected = self.right_list.selectedItems()
+        
+        if not left_selected and not right_selected:
             self.update_status("삭제할 이미지를 선택하세요")
             return
         
-        if self.current_source == 'left':
-            if self.current_index >= len(self.left_images):
-                return
-            image_path = self.left_images[self.current_index]
+        # 어느 쪽 리스트에서 선택되었는지 결정
+        if left_selected:
+            selected_items = left_selected
+            source = 'left'
+            images_list = self.left_images
         else:
-            if self.current_index >= len(self.right_images):
-                return
-            image_path = self.right_images[self.current_index]
+            selected_items = right_selected
+            source = 'right'
+            images_list = self.right_images
+        
+        # 선택된 인덱스 추출 (역순 정렬 - 뒤에서부터 삭제해야 인덱스가 안 꼬임)
+        selected_indices = sorted([self.left_list.row(item) if source == 'left' else self.right_list.row(item) 
+                                   for item in selected_items], reverse=True)
+        
+        count = len(selected_indices)
+        
+        if count == 1:
+            # 단일 삭제
+            idx = selected_indices[0]
+            image_path = images_list[idx]
+            msg = f"정말 삭제하시겠습니까?\n\n{image_path.name}\n\n⚠️ 이 작업은 취소할 수 없습니다!"
+        else:
+            # 다중 삭제
+            msg = f"선택된 {count}개의 이미지를 모두 삭제하시겠습니까?\n\n⚠️ 이 작업은 취소할 수 없습니다!"
         
         reply = QMessageBox.question(
             self, "삭제 확인",
-            f"정말 삭제하시겠습니까?\n\n{image_path.name}\n\n⚠️ 이 작업은 취소할 수 없습니다!",
+            msg,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            try:
-                restore_index = self.current_index
-                restore_source = self.current_source
-                
-                os.remove(str(image_path))
-                
-                if self.current_source == 'left':
-                    self.left_images.pop(self.current_index)
-                else:
-                    self.right_images.pop(self.current_index)
-                
-                self.update_lists(restore_selection=(restore_source, restore_index))
-                self.update_status(f"🗑 삭제됨: {image_path.name}")
-                
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"삭제 실패: {e}")
+            deleted_count = 0
+            failed_count = 0
+            
+            for idx in selected_indices:
+                try:
+                    image_path = images_list[idx]
+                    os.remove(str(image_path))
+                    images_list.pop(idx)
+                    deleted_count += 1
+                except Exception as e:
+                    failed_count += 1
+            
+            # 리스트 업데이트
+            restore_idx = min(selected_indices) if selected_indices else 0
+            restore_idx = min(restore_idx, len(images_list) - 1) if images_list else -1
+            self.update_lists(restore_selection=(source, max(0, restore_idx)))
+            
+            if failed_count == 0:
+                self.update_status(f"🗑 {deleted_count}개 파일 삭제됨")
+            else:
+                self.update_status(f"🗑 {deleted_count}개 삭제, {failed_count}개 실패")
     
     def select_previous(self):
         """이전 항목 선택"""
