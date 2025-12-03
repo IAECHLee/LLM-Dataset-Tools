@@ -410,6 +410,119 @@ class HeatmapThread(QThread):
         self.model_path = model_path
         self.image_path = image_path
         self.use_gpu = use_gpu
+
+
+class MultiHeatmapThread(QThread):
+    """멀티 히트맵(CAM) 생성 스레드"""
+    progress = pyqtSignal(int, int, str)  # current, total, filename
+    single_finished = pyqtSignal(np.ndarray, str)  # heatmap_image, filepath
+    all_finished = pyqtSignal(int, int)  # success_count, total_count
+    error = pyqtSignal(str, str)  # error_msg, filepath
+    
+    def __init__(self, model_path, image_paths, use_gpu=True):
+        super().__init__()
+        self.model_path = model_path
+        self.image_paths = image_paths
+        self.use_gpu = use_gpu
+        self._stop = False
+    
+    def stop(self):
+        self._stop = True
+    
+    def run(self):
+        device_idx = 0 if self.use_gpu else -1
+        success_count = 0
+        total = len(self.image_paths)
+        
+        try:
+            # CAM 출력 활성화된 Predictor 생성 (재사용)
+            if device_idx >= 0:
+                predictor = nrt.Predictor(
+                    str(self.model_path),
+                    nrt.Model.MODELIO_OUT_CAM,
+                    device_idx,
+                    1,
+                    False,
+                    False,
+                    nrt.DEVICE_CUDA_GPU
+                )
+            else:
+                predictor = nrt.Predictor(
+                    str(self.model_path),
+                    nrt.Model.MODELIO_OUT_CAM,
+                    device_idx,
+                    1,
+                    False,
+                    False
+                )
+            
+            if predictor.get_status() != nrt.STATUS_SUCCESS:
+                raise Exception("Predictor 초기화 실패: " + nrt.get_last_error_msg())
+            
+            for i, image_path in enumerate(self.image_paths):
+                if self._stop:
+                    break
+                
+                self.progress.emit(i + 1, total, Path(image_path).name)
+                
+                try:
+                    # 입력 이미지
+                    inputs = nrt.Input()
+                    status = inputs.extend(str(image_path))
+                    if status != nrt.STATUS_SUCCESS:
+                        self.error.emit("입력 이미지 로드 실패", image_path)
+                        continue
+                    
+                    # 추론 (CAM 포함)
+                    results = predictor.predict(inputs)
+                    
+                    if results.get_status() != nrt.STATUS_SUCCESS:
+                        self.error.emit("추론 실패", image_path)
+                        continue
+                    
+                    # CAM 추출
+                    if not results.cams.empty():
+                        cam = results.cams.get(0)
+                        mat_cam = cam.cam_to_numpy()
+                        mat_cam = mat_cam.reshape([cam.get_height(), cam.get_width(), 3])
+                        
+                        # 원본 이미지 로드 (한글 경로 지원)
+                        try:
+                            img_array = np.fromfile(str(image_path), dtype=np.uint8)
+                            original = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                        except:
+                            original = None
+                        
+                        if original is not None:
+                            # CAM을 원본 크기로 리사이즈
+                            cam_resized = cv2.resize(mat_cam, (original.shape[1], original.shape[0]))
+                            
+                            # 원본 이미지와 히트맵 블렌딩
+                            blended = cv2.addWeighted(original, 0.6, cam_resized, 0.4, 0)
+                            
+                            # BGR to RGB + 연속 메모리로 복사
+                            blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+                            blended = np.ascontiguousarray(blended)
+                            
+                            self.single_finished.emit(blended.copy(), str(image_path))
+                            success_count += 1
+                        else:
+                            mat_cam_rgb = cv2.cvtColor(mat_cam, cv2.COLOR_BGR2RGB)
+                            self.single_finished.emit(np.ascontiguousarray(mat_cam_rgb).copy(), str(image_path))
+                            success_count += 1
+                    else:
+                        self.error.emit("CAM 데이터 없음", image_path)
+                        
+                except Exception as e:
+                    self.error.emit(str(e), image_path)
+                    continue
+                
+                self.msleep(10)  # UI 응답성 유지
+            
+            self.all_finished.emit(success_count, total)
+            
+        except Exception as e:
+            self.error.emit(str(e), "")
     
     def run(self):
         try:
@@ -512,8 +625,10 @@ class ModelTestGUI(QMainWindow):
         
         # 히트맵 관련
         self.heatmap_thread = None
+        self.multi_heatmap_thread = None
         self.current_selected_path = None
         self.heatmap_cache = {}  # {filepath: heatmap_pixmap}
+        self.heatmap_generated_set = set()  # 히트맵 생성된 파일 경로 집합
         self.showing_heatmap = False
         
         self.init_ui()
@@ -575,6 +690,25 @@ class ModelTestGUI(QMainWindow):
             }
         """)
         top_layout.addWidget(self.stop_btn)
+        
+        # 멀티 히트맵 생성 버튼
+        self.multi_heatmap_btn = QPushButton("🔥 멀티 히트맵 생성")
+        self.multi_heatmap_btn.clicked.connect(self.generate_multi_heatmap)
+        self.multi_heatmap_btn.setEnabled(False)
+        self.multi_heatmap_btn.setToolTip("Ctrl+클릭으로 선택한 여러 이미지의 히트맵을 한번에 생성합니다")
+        self.multi_heatmap_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #6a3093;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background-color: #8e44ad;
+            }
+            QPushButton:disabled {
+                background-color: #3c3c3c;
+            }
+        """)
+        top_layout.addWidget(self.multi_heatmap_btn)
         
         # 배치 사이즈 설정
         top_layout.addWidget(QLabel("배치 크기:"))
@@ -783,13 +917,15 @@ class ModelTestGUI(QMainWindow):
         self.result_count_label.setStyleSheet("QLabel { font-weight: bold; color: #4a9eff; padding: 5px; }")
         left_layout.addWidget(self.result_count_label)
         
-        # 결과 리스트 (성능 최적화)
+        # 결과 리스트 (성능 최적화 + 다중 선택)
         self.result_list = QListWidget()
         self.result_list.setFont(QFont("Consolas", 9))
         self.result_list.setUniformItemSizes(True)  # 동일 크기 아이템 - 성능 향상
         self.result_list.setLayoutMode(QListWidget.Batched)  # 배치 레이아웃
         self.result_list.setBatchSize(50)  # 50개씩 배치
+        self.result_list.setSelectionMode(QListWidget.ExtendedSelection)  # Ctrl+클릭 다중 선택
         self.result_list.currentRowChanged.connect(self.on_result_selected)
+        self.result_list.itemSelectionChanged.connect(self.on_selection_changed)  # 다중 선택 감지
         left_layout.addWidget(self.result_list)
         
         # 오른쪽: 이미지 뷰어
@@ -1092,9 +1228,12 @@ class ModelTestGUI(QMainWindow):
         
         # 히트맵 캐시 비우기
         self.heatmap_cache.clear()
+        self.heatmap_generated_set.clear()
         self.current_selected_path = None
         self.heatmap_btn.setEnabled(False)
         self.show_original_btn.setEnabled(False)
+        self.multi_heatmap_btn.setEnabled(False)
+        self.multi_heatmap_btn.setText("🔥 멀티 히트맵 생성")
         self.heatmap_status_label.setText("")
         
         # 저장 버튼 비활성화
@@ -1209,6 +1348,9 @@ class ModelTestGUI(QMainWindow):
             
             self.result_list.addItem(item)
         
+        # 히트맵 생성 상태 초기화
+        self.heatmap_generated_set.clear()
+        
         self.result_list.setUpdatesEnabled(True)
         
         self.run_btn.setEnabled(True)
@@ -1316,9 +1458,11 @@ class ModelTestGUI(QMainWindow):
         
         # 히트맵 캐시 확인
         if filepath in self.heatmap_cache:
-            self.heatmap_status_label.setText("✓ 히트맵 캐시됨")
+            self.heatmap_status_label.setText("🔥 히트맵 생성됨")
+            self.heatmap_status_label.setStyleSheet("QLabel { color: #ff9800; font-size: 9pt; font-weight: bold; }")
         else:
-            self.heatmap_status_label.setText("")
+            self.heatmap_status_label.setText("⬜ 히트맵 미생성")
+            self.heatmap_status_label.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
     
     def generate_heatmap(self):
         """선택된 이미지의 히트맵 생성"""
@@ -1360,6 +1504,10 @@ class ModelTestGUI(QMainWindow):
             
             # 캐시에 저장
             self.heatmap_cache[filepath] = pixmap
+            self.heatmap_generated_set.add(filepath)
+            
+            # 리스트 아이템 아이콘 업데이트
+            self.update_item_heatmap_icon(filepath, True)
             
             # 현재 선택된 이미지와 일치하면 표시
             if filepath == self.current_selected_path:
@@ -1565,6 +1713,140 @@ class ModelTestGUI(QMainWindow):
         current = self.result_list.currentRow()
         if current < self.result_list.count() - 1:
             self.result_list.setCurrentRow(current + 1)
+    
+    def on_selection_changed(self):
+        """다중 선택 변경 시 멀티 히트맵 버튼 상태 업데이트"""
+        selected_items = self.result_list.selectedItems()
+        if len(selected_items) > 1:
+            self.multi_heatmap_btn.setEnabled(True)
+            self.multi_heatmap_btn.setText(f"🔥 멀티 히트맵 생성 ({len(selected_items)}개)")
+        else:
+            self.multi_heatmap_btn.setEnabled(False)
+            self.multi_heatmap_btn.setText("🔥 멀티 히트맵 생성")
+    
+    def generate_multi_heatmap(self):
+        """선택된 여러 이미지의 히트맵 일괄 생성"""
+        selected_items = self.result_list.selectedItems()
+        if len(selected_items) < 1:
+            QMessageBox.warning(self, "경고", "Ctrl+클릭으로 여러 이미지를 선택하세요.")
+            return
+        
+        if not self.model_path:
+            QMessageBox.warning(self, "경고", "모델이 선택되지 않았습니다.")
+            return
+        
+        # 이미 캐시된 것 제외하고 생성할 이미지 목록
+        image_paths = []
+        for item in selected_items:
+            filepath = item.data(Qt.UserRole)
+            if filepath and filepath not in self.heatmap_cache:
+                image_paths.append(filepath)
+        
+        if not image_paths:
+            QMessageBox.information(self, "알림", "선택된 모든 이미지의 히트맵이 이미 생성되어 있습니다.")
+            return
+        
+        # UI 상태 변경
+        self.multi_heatmap_btn.setEnabled(False)
+        self.multi_heatmap_btn.setText(f"🔄 생성 중... (0/{len(image_paths)})")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(image_paths))
+        self.progress_bar.setValue(0)
+        
+        # 멀티 히트맵 스레드 시작
+        self.multi_heatmap_thread = MultiHeatmapThread(
+            str(self.model_path),
+            image_paths,
+            use_gpu=True
+        )
+        self.multi_heatmap_thread.progress.connect(self.on_multi_heatmap_progress, Qt.QueuedConnection)
+        self.multi_heatmap_thread.single_finished.connect(self.on_multi_heatmap_single, Qt.QueuedConnection)
+        self.multi_heatmap_thread.all_finished.connect(self.on_multi_heatmap_finished, Qt.QueuedConnection)
+        self.multi_heatmap_thread.error.connect(self.on_multi_heatmap_error, Qt.QueuedConnection)
+        self.multi_heatmap_thread.start()
+    
+    def on_multi_heatmap_progress(self, current, total, filename):
+        """멀티 히트맵 진행 상황"""
+        self.progress_bar.setValue(current)
+        self.multi_heatmap_btn.setText(f"🔄 생성 중... ({current}/{total})")
+    
+    def on_multi_heatmap_single(self, heatmap_array, filepath):
+        """개별 히트맵 생성 완료"""
+        try:
+            # numpy array를 QPixmap으로 변환
+            img = np.ascontiguousarray(heatmap_array)
+            h, w, ch = img.shape
+            bytes_per_line = ch * w
+            
+            qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())
+            
+            if not pixmap.isNull():
+                # 캐시에 저장
+                self.heatmap_cache[filepath] = pixmap
+                self.heatmap_generated_set.add(filepath)
+                
+                # 리스트 아이템 아이콘 업데이트
+                self.update_item_heatmap_icon(filepath, True)
+                
+        except Exception as e:
+            print(f"히트맵 캐시 저장 오류: {e}")
+    
+    def on_multi_heatmap_finished(self, success_count, total_count):
+        """멀티 히트맵 생성 완료"""
+        self.progress_bar.setVisible(False)
+        self.multi_heatmap_btn.setEnabled(False)
+        self.multi_heatmap_btn.setText("🔥 멀티 히트맵 생성")
+        self.on_selection_changed()  # 버튼 상태 갱신
+        
+        QMessageBox.information(
+            self, 
+            "멀티 히트맵 완료", 
+            f"히트맵 생성 완료!\n\n성공: {success_count}개\n실패: {total_count - success_count}개"
+        )
+    
+    def on_multi_heatmap_error(self, error_msg, filepath):
+        """멀티 히트맵 개별 오류"""
+        if filepath:
+            print(f"히트맵 오류 ({Path(filepath).name}): {error_msg}")
+    
+    def update_item_heatmap_icon(self, filepath, has_heatmap):
+        """리스트 아이템의 히트맵 아이콘 상태 업데이트"""
+        for i in range(self.result_list.count()):
+            item = self.result_list.item(i)
+            if item.data(Qt.UserRole) == filepath:
+                # 현재 텍스트에서 기존 아이콘 제거
+                text = item.text()
+                if text.startswith("🔥 "):
+                    text = text[2:]
+                elif text.startswith("⬜ "):
+                    text = text[2:]
+                
+                # 새 아이콘 추가
+                if has_heatmap:
+                    item.setText(f"🔥 {text}")
+                else:
+                    item.setText(f"⬜ {text}")
+                break
+    
+    def update_all_heatmap_icons(self):
+        """모든 리스트 아이템의 히트맵 아이콘 업데이트"""
+        for i in range(self.result_list.count()):
+            item = self.result_list.item(i)
+            filepath = item.data(Qt.UserRole)
+            
+            # 현재 텍스트에서 기존 아이콘 제거
+            text = item.text()
+            if text.startswith("🔥 "):
+                text = text[2:]
+            elif text.startswith("⬜ "):
+                text = text[2:]
+            
+            # 히트맵 생성 여부에 따라 아이콘 설정
+            if filepath in self.heatmap_generated_set:
+                item.setText(f"🔥 {text}")
+            else:
+                item.setText(f"⬜ {text}")
 
 
 def main():
