@@ -296,6 +296,8 @@ class InferenceThread(QThread):
             # 모든 결과를 저장할 리스트
             all_results = []
             preview_interval = 10  # 10장마다 미리보기
+            progress_interval = 5  # 5배치마다 progress 업데이트
+            batch_count = 0
             
             # 배치 단위로 처리
             for batch_start in range(0, total, self.batch_size):
@@ -304,9 +306,12 @@ class InferenceThread(QThread):
                 
                 batch_end = min(batch_start + self.batch_size, total)
                 batch_files = image_files[batch_start:batch_end]
+                batch_count += 1
                 
-                # progress는 매 배치마다 emit (간략히)
-                self.progress.emit(batch_end, total, f"처리 중... {batch_end}/{total}")
+                # progress는 N배치마다 emit (UI 부하 감소)
+                if batch_count % progress_interval == 0 or batch_end == total:
+                    self.progress.emit(batch_end, total, f"처리 중... {batch_end}/{total}")
+                    self.msleep(1)  # UI 스레드에 제어권 양보
                 
                 try:
                     # Input 생성 및 배치 이미지 추가
@@ -358,6 +363,10 @@ class InferenceThread(QThread):
                             
                             # 10장마다 미리보기 업데이트 (이미지 포함)
                             if processed % preview_interval == 0:
+                                # stop 체크
+                                if self._stop:
+                                    break
+                                    
                                 # 미리보기용 이미지 로드 (한글 경로 지원)
                                 try:
                                     img_array = np.fromfile(str(img_path), dtype=np.uint8)
@@ -374,6 +383,7 @@ class InferenceThread(QThread):
                                         preview_img = cv2.resize(preview_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
                                     preview_img = cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB)
                                     self.preview.emit(preview_img, str(img_path), predicted_class, confidence)
+                                    self.msleep(5)  # UI 스레드에 제어권 양보
                             
                         except Exception as e:
                             print(f"결과 파싱 오류 {img_path}: {e}")
@@ -447,8 +457,13 @@ class HeatmapThread(QThread):
                 mat_cam = cam.cam_to_numpy()
                 mat_cam = mat_cam.reshape([cam.get_height(), cam.get_width(), 3])
                 
-                # 원본 이미지 로드
-                original = cv2.imread(str(self.image_path))
+                # 원본 이미지 로드 (한글 경로 지원)
+                try:
+                    img_array = np.fromfile(str(self.image_path), dtype=np.uint8)
+                    original = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                except:
+                    original = None
+                    
                 if original is not None:
                     # CAM을 원본 크기로 리사이즈
                     cam_resized = cv2.resize(mat_cam, (original.shape[1], original.shape[0]))
@@ -456,12 +471,15 @@ class HeatmapThread(QThread):
                     # 원본 이미지와 히트맵 블렌딩
                     blended = cv2.addWeighted(original, 0.6, cam_resized, 0.4, 0)
                     
-                    # BGR to RGB
+                    # BGR to RGB + 연속 메모리로 복사
                     blended = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB)
+                    blended = np.ascontiguousarray(blended)
                     
-                    self.finished.emit(blended, str(self.image_path))
+                    self.finished.emit(blended.copy(), str(self.image_path))
                 else:
-                    self.finished.emit(mat_cam, str(self.image_path))
+                    # CAM만 RGB로 변환 후 전송
+                    mat_cam_rgb = cv2.cvtColor(mat_cam, cv2.COLOR_BGR2RGB)
+                    self.finished.emit(np.ascontiguousarray(mat_cam_rgb).copy(), str(self.image_path))
             else:
                 raise Exception("CAM 데이터가 없습니다. 모델이 CAM을 지원하지 않을 수 있습니다.")
                 
@@ -933,6 +951,37 @@ class ModelTestGUI(QMainWindow):
         
         layout.addWidget(low_conf_group)
         
+        # 분류 정보 저장 버튼
+        save_group = QGroupBox("분류 결과 내보내기")
+        save_layout = QHBoxLayout(save_group)
+        
+        self.save_json_btn = QPushButton("📁 분류 정보 JSON 저장")
+        self.save_json_btn.setEnabled(False)
+        self.save_json_btn.clicked.connect(self.save_classification_json)
+        self.save_json_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #388e3c;
+                color: white;
+                padding: 10px 20px;
+                font-size: 12pt;
+            }
+            QPushButton:hover {
+                background-color: #43a047;
+            }
+            QPushButton:disabled {
+                background-color: #3c3c3c;
+            }
+        """)
+        save_layout.addWidget(self.save_json_btn)
+        
+        self.save_status_label = QLabel("")
+        self.save_status_label.setStyleSheet("QLabel { color: #888; padding: 10px; }")
+        save_layout.addWidget(self.save_status_label)
+        
+        save_layout.addStretch()
+        
+        layout.addWidget(save_group)
+        
         return widget
     
     def load_models(self):
@@ -1048,6 +1097,10 @@ class ModelTestGUI(QMainWindow):
         self.show_original_btn.setEnabled(False)
         self.heatmap_status_label.setText("")
         
+        # 저장 버튼 비활성화
+        self.save_json_btn.setEnabled(False)
+        self.save_status_label.setText("")
+        
         # UI 상태 변경
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1069,8 +1122,21 @@ class ModelTestGUI(QMainWindow):
     
     def stop_inference(self):
         """추론 중지"""
-        if self.inference_thread:
+        if self.inference_thread and self.inference_thread.isRunning():
             self.inference_thread.stop()
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.setText("중지 중...")
+            
+            # 스레드가 종료될 때까지 대기 (최대 3초, UI 블로킹 방지)
+            for _ in range(30):
+                if not self.inference_thread.isRunning():
+                    break
+                QApplication.processEvents()
+                self.inference_thread.wait(100)
+            
+            self.stop_btn.setText("⏹ 중지")
+            self.run_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
     
     def on_progress(self, current, total, filename):
         """진행 상황 업데이트"""
@@ -1148,6 +1214,10 @@ class ModelTestGUI(QMainWindow):
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
+        
+        # 저장 버튼 활성화
+        self.save_json_btn.setEnabled(True)
+        self.save_status_label.setText(f"저장 가능: {len(self.results)}개 이미지")
         
         # 통계 업데이트
         self.update_statistics()
@@ -1276,20 +1346,32 @@ class ModelTestGUI(QMainWindow):
     
     def on_heatmap_generated(self, heatmap_array, filepath):
         """히트맵 생성 완료"""
-        # numpy array를 QPixmap으로 변환
-        h, w, ch = heatmap_array.shape
-        qimg = QImage(heatmap_array.data, w, h, ch * w, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg.copy())
-        
-        # 캐시에 저장
-        self.heatmap_cache[filepath] = pixmap
-        
-        # 현재 선택된 이미지와 일치하면 표시
-        if filepath == self.current_selected_path:
-            self._display_heatmap(pixmap)
-        
-        self.heatmap_btn.setEnabled(True)
-        self.heatmap_status_label.setText("✓ 히트맵 생성 완료")
+        try:
+            # numpy array를 QPixmap으로 변환 (안정성 개선)
+            img = np.ascontiguousarray(heatmap_array)
+            h, w, ch = img.shape
+            bytes_per_line = ch * w
+            
+            qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg.copy())
+            
+            if pixmap.isNull():
+                raise Exception("히트맵 QPixmap 변환 실패")
+            
+            # 캐시에 저장
+            self.heatmap_cache[filepath] = pixmap
+            
+            # 현재 선택된 이미지와 일치하면 표시
+            if filepath == self.current_selected_path:
+                self._display_heatmap(pixmap)
+            
+            self.heatmap_btn.setEnabled(True)
+            self.heatmap_status_label.setText("✓ 히트맵 생성 완료")
+            
+        except Exception as e:
+            print(f"히트맵 표시 오류: {e}")
+            self.heatmap_btn.setEnabled(True)
+            self.heatmap_status_label.setText("❌ 표시 오류")
     
     def on_heatmap_error(self, error_msg):
         """히트맵 생성 오류"""
@@ -1314,6 +1396,96 @@ class ModelTestGUI(QMainWindow):
             self.image_viewer.set_image(self.current_selected_path)
             self.showing_heatmap = False
             self.show_original_btn.setEnabled(False)
+    
+    def save_classification_json(self):
+        """분류 결과를 JSON 파일로 저장"""
+        import json
+        from datetime import datetime
+        
+        if not self.results:
+            QMessageBox.warning(self, "경고", "저장할 분류 결과가 없습니다.")
+            return
+        
+        # 저장 폴더 설정
+        save_folder = Path(r"D:\LLM_Dataset\output\Classification Info")
+        save_folder.mkdir(parents=True, exist_ok=True)
+        
+        # 기본 파일명: 소스 폴더 이름.json
+        if self.image_folder:
+            folder_name = self.image_folder.name
+        else:
+            folder_name = f"classification_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        default_path = save_folder / f"{folder_name}.json"
+        
+        # 저장 경로 선택 (기본 경로 제안)
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "분류 결과 저장",
+            str(default_path),
+            "JSON 파일 (*.json)"
+        )
+        
+        if not save_path:
+            return
+        
+        try:
+            # 분류 결과 데이터 구성
+            classification_data = {
+                "metadata": {
+                    "created_at": datetime.now().isoformat(),
+                    "model_name": self.model_path.name if self.model_path else "unknown",
+                    "source_folder": str(self.image_folder) if self.image_folder else "unknown",
+                    "total_images": len(self.results),
+                    "class_names": self.class_names
+                },
+                "statistics": {
+                    "by_class": {}
+                },
+                "images": []
+            }
+            
+            # 클래스별 통계
+            class_counts = defaultdict(int)
+            for filepath, (predicted_class, confidence, all_probs) in self.results.items():
+                class_counts[predicted_class] += 1
+            
+            for class_name, count in class_counts.items():
+                classification_data["statistics"]["by_class"][class_name] = {
+                    "count": count,
+                    "percentage": round(count / len(self.results) * 100, 2)
+                }
+            
+            # 이미지별 분류 정보
+            for filepath, (predicted_class, confidence, all_probs) in self.results.items():
+                image_info = {
+                    "filename": Path(filepath).name,
+                    "filepath": filepath,
+                    "predicted_class": predicted_class,
+                    "confidence": round(confidence, 4),
+                    "all_probabilities": {name: round(prob, 4) for name, prob in all_probs}
+                }
+                classification_data["images"].append(image_info)
+            
+            # 파일명 기준 정렬
+            classification_data["images"].sort(key=lambda x: x["filename"])
+            
+            # JSON 파일 저장
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(classification_data, f, ensure_ascii=False, indent=2)
+            
+            self.save_status_label.setText(f"✓ 저장 완료: {Path(save_path).name}")
+            QMessageBox.information(
+                self, 
+                "저장 완료", 
+                f"분류 결과가 저장되었습니다.\n\n"
+                f"📁 파일: {save_path}\n"
+                f"📊 이미지 수: {len(self.results)}개"
+            )
+            
+        except Exception as e:
+            self.save_status_label.setText("❌ 저장 실패")
+            QMessageBox.critical(self, "저장 오류", f"파일 저장 중 오류가 발생했습니다:\n{str(e)}")
     
     def update_statistics(self):
         """통계 업데이트"""

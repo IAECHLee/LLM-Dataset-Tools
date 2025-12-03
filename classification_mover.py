@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Classification Mover - 분류 결과 기반 이미지 이동 도구
+
+기능:
+1. JSON 분류 파일 로드
+2. 원본 폴더에서 이미지 검색
+3. 분류(Normal, Twist, Hook)별 서브폴더 생성
+4. 이미지를 해당 분류 폴더로 이동/복사
+"""
+
+import sys
+import os
+import json
+import shutil
+from pathlib import Path
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
+    QListWidget, QListWidgetItem, QGroupBox, QRadioButton, QButtonGroup,
+    QCheckBox, QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
+    QSplitter, QTextEdit
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QColor
+
+
+class MoverThread(QThread):
+    """파일 이동/복사 스레드"""
+    progress = pyqtSignal(int, int, str)  # current, total, filename
+    finished = pyqtSignal(int, int, int)  # success, failed, skipped
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)  # 로그 메시지
+    
+    def __init__(self, classification_data, search_root, move_mode=True):
+        super().__init__()
+        self.classification_data = classification_data
+        self.search_root = Path(search_root)
+        self.move_mode = move_mode  # True: 이동, False: 복사
+        self._stop = False
+    
+    def stop(self):
+        self._stop = True
+    
+    def run(self):
+        try:
+            images = self.classification_data.get("images", [])
+            source_folder_name = Path(self.classification_data["metadata"]["source_folder"]).name
+            
+            # 소스 폴더 찾기
+            source_folder = self.find_folder(source_folder_name)
+            
+            if not source_folder:
+                self.error.emit(f"폴더를 찾을 수 없습니다: {source_folder_name}")
+                return
+            
+            self.log.emit(f"📁 소스 폴더 발견: {source_folder}")
+            
+            # 분류별 서브폴더 생성
+            class_names = self.classification_data["metadata"].get("class_names", ["Normal", "Twist", "Hook"])
+            class_folders = {}
+            
+            for class_name in class_names:
+                class_folder = source_folder / class_name
+                class_folder.mkdir(exist_ok=True)
+                class_folders[class_name] = class_folder
+                self.log.emit(f"📂 폴더 생성: {class_folder}")
+            
+            total = len(images)
+            success = 0
+            failed = 0
+            skipped = 0
+            
+            for i, image_info in enumerate(images):
+                if self._stop:
+                    self.log.emit("⚠️ 사용자에 의해 중지됨")
+                    break
+                
+                filename = image_info["filename"]
+                predicted_class = image_info["predicted_class"]
+                
+                self.progress.emit(i + 1, total, filename)
+                
+                # 원본 파일 찾기
+                source_file = source_folder / filename
+                
+                if not source_file.exists():
+                    self.log.emit(f"⚠️ 파일 없음: {filename}")
+                    skipped += 1
+                    continue
+                
+                # 대상 폴더
+                if predicted_class not in class_folders:
+                    self.log.emit(f"⚠️ 알 수 없는 클래스: {predicted_class}")
+                    skipped += 1
+                    continue
+                
+                dest_folder = class_folders[predicted_class]
+                dest_file = dest_folder / filename
+                
+                # 이미 대상 폴더에 있는 경우
+                if dest_file.exists():
+                    skipped += 1
+                    continue
+                
+                try:
+                    if self.move_mode:
+                        shutil.move(str(source_file), str(dest_file))
+                    else:
+                        shutil.copy2(str(source_file), str(dest_file))
+                    success += 1
+                except Exception as e:
+                    self.log.emit(f"❌ 실패 ({filename}): {e}")
+                    failed += 1
+                
+                # UI 반응성
+                self.msleep(1)
+            
+            self.finished.emit(success, failed, skipped)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+    
+    def find_folder(self, folder_name):
+        """검색 루트에서 폴더 이름으로 찾기"""
+        # 정확히 일치하는 폴더 찾기
+        for root, dirs, files in os.walk(self.search_root):
+            for d in dirs:
+                if d == folder_name:
+                    return Path(root) / d
+        return None
+
+
+class ClassificationMoverGUI(QMainWindow):
+    """분류 이동 메인 GUI"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Classification Mover - 분류 결과 기반 이미지 이동")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        # 데이터
+        self.classification_data = None
+        self.json_path = None
+        self.search_root = Path(r"K:\LLM Image_Storage")  # 기본 검색 루트
+        
+        # 스레드
+        self.mover_thread = None
+        
+        self.init_ui()
+    
+    def init_ui(self):
+        """UI 초기화"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QVBoxLayout(central_widget)
+        
+        # JSON 파일 선택
+        json_group = QGroupBox("1. 분류 JSON 파일 선택")
+        json_layout = QHBoxLayout(json_group)
+        
+        self.json_path_label = QLabel("JSON 파일을 선택하세요")
+        self.json_path_label.setStyleSheet("QLabel { color: #888; padding: 5px; }")
+        json_layout.addWidget(self.json_path_label, 1)
+        
+        self.load_json_btn = QPushButton("📂 JSON 파일 선택")
+        self.load_json_btn.clicked.connect(self.load_json_file)
+        json_layout.addWidget(self.load_json_btn)
+        
+        self.load_folder_btn = QPushButton("📁 JSON 폴더 열기")
+        self.load_folder_btn.clicked.connect(self.open_json_folder)
+        json_layout.addWidget(self.load_folder_btn)
+        
+        main_layout.addWidget(json_group)
+        
+        # 검색 루트 설정
+        search_group = QGroupBox("2. 이미지 검색 루트 폴더")
+        search_layout = QHBoxLayout(search_group)
+        
+        self.search_root_edit = QLineEdit(str(self.search_root))
+        self.search_root_edit.setStyleSheet("QLineEdit { padding: 5px; }")
+        search_layout.addWidget(self.search_root_edit, 1)
+        
+        self.browse_search_btn = QPushButton("📂 변경")
+        self.browse_search_btn.clicked.connect(self.browse_search_root)
+        search_layout.addWidget(self.browse_search_btn)
+        
+        main_layout.addWidget(search_group)
+        
+        # 스플리터 (정보 + 로그)
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # 왼쪽: 분류 정보
+        info_widget = QWidget()
+        info_layout = QVBoxLayout(info_widget)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        
+        info_group = QGroupBox("분류 정보")
+        info_inner_layout = QVBoxLayout(info_group)
+        
+        # 메타데이터
+        self.meta_label = QLabel("JSON 파일을 로드하세요")
+        self.meta_label.setWordWrap(True)
+        self.meta_label.setStyleSheet("QLabel { background-color: #2a2a2a; padding: 10px; border-radius: 5px; }")
+        info_inner_layout.addWidget(self.meta_label)
+        
+        # 통계 테이블
+        self.stats_table = QTableWidget()
+        self.stats_table.setColumnCount(3)
+        self.stats_table.setHorizontalHeaderLabels(["클래스", "개수", "비율"])
+        self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.stats_table.setMaximumHeight(150)
+        info_inner_layout.addWidget(self.stats_table)
+        
+        info_layout.addWidget(info_group)
+        splitter.addWidget(info_widget)
+        
+        # 오른쪽: 로그
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        
+        log_group = QGroupBox("작업 로그")
+        log_inner_layout = QVBoxLayout(log_group)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setStyleSheet("QTextEdit { background-color: #1e1e1e; color: #d4d4d4; }")
+        log_inner_layout.addWidget(self.log_text)
+        
+        log_layout.addWidget(log_group)
+        splitter.addWidget(log_widget)
+        
+        splitter.setSizes([400, 600])
+        main_layout.addWidget(splitter)
+        
+        # 옵션
+        option_group = QGroupBox("3. 작업 옵션")
+        option_layout = QHBoxLayout(option_group)
+        
+        self.move_radio = QRadioButton("이동 (원본 삭제)")
+        self.copy_radio = QRadioButton("복사 (원본 유지)")
+        self.move_radio.setChecked(True)
+        
+        option_layout.addWidget(self.move_radio)
+        option_layout.addWidget(self.copy_radio)
+        option_layout.addStretch()
+        
+        main_layout.addWidget(option_group)
+        
+        # 진행바
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
+        
+        # 실행 버튼
+        btn_layout = QHBoxLayout()
+        
+        self.run_btn = QPushButton("▶ 분류별 이동 시작")
+        self.run_btn.setEnabled(False)
+        self.run_btn.clicked.connect(self.start_moving)
+        self.run_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0e639c;
+                color: white;
+                padding: 15px 30px;
+                font-size: 14pt;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #1177bb; }
+            QPushButton:disabled { background-color: #3c3c3c; }
+        """)
+        btn_layout.addWidget(self.run_btn)
+        
+        self.stop_btn = QPushButton("⏹ 중지")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_moving)
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                padding: 15px 30px;
+                font-size: 14pt;
+            }
+            QPushButton:hover { background-color: #f44336; }
+            QPushButton:disabled { background-color: #3c3c3c; }
+        """)
+        btn_layout.addWidget(self.stop_btn)
+        
+        main_layout.addLayout(btn_layout)
+        
+        # 다크 테마
+        self.setStyleSheet("""
+            QMainWindow { background-color: #1e1e1e; }
+            QWidget { background-color: #1e1e1e; color: #d4d4d4; }
+            QGroupBox {
+                border: 2px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QPushButton {
+                background-color: #0e639c;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #1177bb; }
+            QLineEdit {
+                background-color: #2a2a2a;
+                border: 1px solid #3c3c3c;
+                color: #d4d4d4;
+                padding: 5px;
+            }
+            QTableWidget {
+                background-color: #2a2a2a;
+                border: 1px solid #3c3c3c;
+                gridline-color: #3c3c3c;
+            }
+            QTableWidget::item { padding: 5px; }
+            QRadioButton { spacing: 10px; }
+        """)
+    
+    def open_json_folder(self):
+        """JSON 폴더 열기"""
+        json_folder = Path(r"D:\LLM_Dataset\output\Classification Info")
+        json_folder.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(json_folder))
+    
+    def load_json_file(self):
+        """JSON 파일 로드"""
+        json_folder = Path(r"D:\LLM_Dataset\output\Classification Info")
+        json_folder.mkdir(parents=True, exist_ok=True)
+        
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "분류 JSON 파일 선택",
+            str(json_folder),
+            "JSON 파일 (*.json)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                self.classification_data = json.load(f)
+            
+            self.json_path = Path(file_path)
+            self.json_path_label.setText(str(self.json_path))
+            self.json_path_label.setStyleSheet("QLabel { color: #4a9eff; padding: 5px; }")
+            
+            # 정보 표시
+            self.display_classification_info()
+            
+            self.run_btn.setEnabled(True)
+            self.log_text.clear()
+            self.log_text.append(f"✓ JSON 파일 로드 완료: {self.json_path.name}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"JSON 파일 로드 실패:\n{str(e)}")
+    
+    def display_classification_info(self):
+        """분류 정보 표시"""
+        if not self.classification_data:
+            return
+        
+        meta = self.classification_data.get("metadata", {})
+        stats = self.classification_data.get("statistics", {}).get("by_class", {})
+        
+        # 메타데이터
+        meta_text = f"""
+<b>📁 소스 폴더:</b> {Path(meta.get('source_folder', 'N/A')).name}<br>
+<b>🤖 모델:</b> {meta.get('model_name', 'N/A')}<br>
+<b>📊 총 이미지:</b> {meta.get('total_images', 0)}개<br>
+<b>📅 생성일:</b> {meta.get('created_at', 'N/A')[:19]}
+        """
+        self.meta_label.setText(meta_text)
+        
+        # 통계 테이블
+        self.stats_table.setRowCount(len(stats))
+        for i, (class_name, data) in enumerate(stats.items()):
+            self.stats_table.setItem(i, 0, QTableWidgetItem(class_name))
+            self.stats_table.setItem(i, 1, QTableWidgetItem(str(data.get("count", 0))))
+            self.stats_table.setItem(i, 2, QTableWidgetItem(f"{data.get('percentage', 0):.1f}%"))
+            
+            # 색상
+            if class_name == "Normal":
+                color = QColor("#4caf50")
+            elif class_name == "Twist":
+                color = QColor("#ff9800")
+            elif class_name == "Hook":
+                color = QColor("#f44336")
+            else:
+                color = QColor("#4a9eff")
+            
+            for j in range(3):
+                item = self.stats_table.item(i, j)
+                if item:
+                    item.setForeground(color)
+    
+    def browse_search_root(self):
+        """검색 루트 폴더 변경"""
+        folder = QFileDialog.getExistingDirectory(
+            self, "검색 루트 폴더 선택",
+            str(self.search_root)
+        )
+        if folder:
+            self.search_root = Path(folder)
+            self.search_root_edit.setText(str(self.search_root))
+    
+    def start_moving(self):
+        """이동 시작"""
+        if not self.classification_data:
+            return
+        
+        # 검색 루트 업데이트
+        self.search_root = Path(self.search_root_edit.text())
+        
+        if not self.search_root.exists():
+            QMessageBox.warning(self, "경고", "검색 루트 폴더가 존재하지 않습니다.")
+            return
+        
+        # 확인
+        source_folder = Path(self.classification_data["metadata"]["source_folder"]).name
+        total = self.classification_data["metadata"]["total_images"]
+        mode = "이동" if self.move_radio.isChecked() else "복사"
+        
+        reply = QMessageBox.question(
+            self, "확인",
+            f"다음 작업을 진행하시겠습니까?\n\n"
+            f"📁 대상 폴더: {source_folder}\n"
+            f"📊 이미지 수: {total}개\n"
+            f"🔄 작업 모드: {mode}\n\n"
+            f"⚠️ 원본 폴더 내에 분류별 서브폴더가 생성됩니다.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # UI 상태 변경
+        self.run_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        self.log_text.append("\n" + "="*50)
+        self.log_text.append(f"🚀 작업 시작 ({mode} 모드)")
+        
+        # 스레드 시작
+        self.mover_thread = MoverThread(
+            self.classification_data,
+            self.search_root,
+            move_mode=self.move_radio.isChecked()
+        )
+        self.mover_thread.progress.connect(self.on_progress)
+        self.mover_thread.finished.connect(self.on_finished)
+        self.mover_thread.error.connect(self.on_error)
+        self.mover_thread.log.connect(self.on_log)
+        self.mover_thread.start()
+    
+    def stop_moving(self):
+        """이동 중지"""
+        if self.mover_thread:
+            self.mover_thread.stop()
+    
+    def on_progress(self, current, total, filename):
+        """진행 상황"""
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current)
+        self.progress_bar.setFormat(f"{current}/{total} - {filename}")
+    
+    def on_log(self, message):
+        """로그 메시지"""
+        self.log_text.append(message)
+        # 스크롤 아래로
+        scrollbar = self.log_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+    
+    def on_finished(self, success, failed, skipped):
+        """완료"""
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        
+        self.log_text.append("="*50)
+        self.log_text.append(f"✅ 작업 완료!")
+        self.log_text.append(f"   • 성공: {success}개")
+        self.log_text.append(f"   • 실패: {failed}개")
+        self.log_text.append(f"   • 건너뜀: {skipped}개")
+        
+        QMessageBox.information(
+            self, "완료",
+            f"작업이 완료되었습니다.\n\n"
+            f"✅ 성공: {success}개\n"
+            f"❌ 실패: {failed}개\n"
+            f"⏭️ 건너뜀: {skipped}개"
+        )
+    
+    def on_error(self, error_msg):
+        """에러"""
+        self.run_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        
+        self.log_text.append(f"❌ 오류: {error_msg}")
+        QMessageBox.critical(self, "오류", f"작업 중 오류 발생:\n{error_msg}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    window = ClassificationMoverGUI()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
