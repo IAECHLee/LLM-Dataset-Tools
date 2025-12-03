@@ -148,6 +148,12 @@ class ClassificationMoverGUI(QMainWindow):
         # 스레드
         self.mover_thread = None
         
+        # 자동화 관련
+        self.automation_json_files = []  # 자동화 대상 JSON 파일 목록
+        self.automation_index = 0  # 현재 처리 중인 인덱스
+        self.is_automation_running = False
+        self.automation_results = []  # 자동화 결과 저장
+        
         self.init_ui()
     
     def init_ui(self):
@@ -172,6 +178,21 @@ class ClassificationMoverGUI(QMainWindow):
         self.load_folder_btn = QPushButton("📁 JSON 폴더 열기")
         self.load_folder_btn.clicked.connect(self.open_json_folder)
         json_layout.addWidget(self.load_folder_btn)
+        
+        # 자동화 버튼 추가
+        self.auto_btn = QPushButton("⚡ 자동화")
+        self.auto_btn.setToolTip("여러 JSON 파일을 선택하여 순차적으로 처리")
+        self.auto_btn.clicked.connect(self.start_automation)
+        self.auto_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6f00;
+                padding: 8px 15px;
+            }
+            QPushButton:hover {
+                background-color: #ff8f00;
+            }
+        """)
+        json_layout.addWidget(self.auto_btn)
         
         main_layout.addWidget(json_group)
         
@@ -515,7 +536,304 @@ class ClassificationMoverGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         
         self.log_text.append(f"❌ 오류: {error_msg}")
-        QMessageBox.critical(self, "오류", f"작업 중 오류 발생:\n{error_msg}")
+        
+        # 자동화 모드면 다음 파일로 계속
+        if self.is_automation_running:
+            self.automation_results.append({
+                "file": self.json_path.name if self.json_path else "Unknown",
+                "status": "error",
+                "message": error_msg
+            })
+            self.automation_index += 1
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(500, self.process_next_automation_json)
+        else:
+            QMessageBox.critical(self, "오류", f"작업 중 오류 발생:\n{error_msg}")
+    
+    def start_automation(self):
+        """자동화 시작 - 여러 JSON 파일 선택"""
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QListWidget, QAbstractItemView
+        
+        json_folder = Path(r"D:\LLM_Dataset\output\Classification Info")
+        json_folder.mkdir(parents=True, exist_ok=True)
+        
+        # 파일 선택 다이얼로그
+        dialog = QDialog(self)
+        dialog.setWindowTitle("자동화 - JSON 파일 선택")
+        dialog.setMinimumSize(700, 500)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+            }
+            QLabel {
+                color: #d4d4d4;
+            }
+            QListWidget {
+                background-color: #2a2a2a;
+                border: 1px solid #3c3c3c;
+                color: #d4d4d4;
+            }
+            QListWidget::item:selected {
+                background-color: #0e639c;
+            }
+            QPushButton {
+                background-color: #0e639c;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #1177bb;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 안내 레이블
+        info_label = QLabel("처리할 JSON 파일들을 선택하세요 (Ctrl+클릭으로 다중 선택)")
+        info_label.setStyleSheet("QLabel { font-size: 12pt; padding: 10px; }")
+        layout.addWidget(info_label)
+        
+        # 버튼 레이아웃
+        btn_layout = QHBoxLayout()
+        
+        add_files_btn = QPushButton("📄 파일 추가")
+        btn_layout.addWidget(add_files_btn)
+        
+        add_all_btn = QPushButton("📁 폴더 내 전체 추가")
+        btn_layout.addWidget(add_all_btn)
+        
+        btn_layout.addStretch()
+        
+        clear_btn = QPushButton("🗑 목록 비우기")
+        btn_layout.addWidget(clear_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # 파일 리스트
+        file_list = QListWidget()
+        file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        layout.addWidget(file_list)
+        
+        # 선택된 파일 수 레이블
+        count_label = QLabel("선택된 파일: 0개")
+        count_label.setStyleSheet("QLabel { color: #4a9eff; font-weight: bold; }")
+        layout.addWidget(count_label)
+        
+        def add_files():
+            files, _ = QFileDialog.getOpenFileNames(
+                dialog, "JSON 파일 선택",
+                str(json_folder),
+                "JSON 파일 (*.json)"
+            )
+            for f in files:
+                # 이미 있는지 확인
+                existing = [file_list.item(i).data(Qt.UserRole) for i in range(file_list.count())]
+                if f not in existing:
+                    item = QListWidgetItem(Path(f).name)
+                    item.setData(Qt.UserRole, f)
+                    file_list.addItem(item)
+            count_label.setText(f"선택된 파일: {file_list.count()}개")
+        
+        def add_all_from_folder():
+            folder = QFileDialog.getExistingDirectory(
+                dialog, "JSON 폴더 선택",
+                str(json_folder)
+            )
+            if folder:
+                folder_path = Path(folder)
+                existing = [file_list.item(i).data(Qt.UserRole) for i in range(file_list.count())]
+                for json_file in sorted(folder_path.glob("*.json")):
+                    if str(json_file) not in existing:
+                        item = QListWidgetItem(json_file.name)
+                        item.setData(Qt.UserRole, str(json_file))
+                        file_list.addItem(item)
+                count_label.setText(f"선택된 파일: {file_list.count()}개")
+        
+        def clear_files():
+            file_list.clear()
+            count_label.setText("선택된 파일: 0개")
+        
+        add_files_btn.clicked.connect(add_files)
+        add_all_btn.clicked.connect(add_all_from_folder)
+        clear_btn.clicked.connect(clear_files)
+        
+        # 버튼 박스
+        button_box = QDialogButtonBox()
+        start_btn = button_box.addButton("▶ 자동화 시작", QDialogButtonBox.AcceptRole)
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0a7a0a;
+                padding: 10px 30px;
+                font-size: 12pt;
+            }
+            QPushButton:hover {
+                background-color: #0c9a0c;
+            }
+        """)
+        cancel_btn = button_box.addButton("취소", QDialogButtonBox.RejectRole)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            # 파일 목록 가져오기
+            json_files = [file_list.item(i).data(Qt.UserRole) for i in range(file_list.count())]
+            
+            if not json_files:
+                QMessageBox.warning(self, "경고", "처리할 JSON 파일을 추가하세요.")
+                return
+            
+            # 검색 루트 확인
+            self.search_root = Path(self.search_root_edit.text())
+            if not self.search_root.exists():
+                QMessageBox.warning(self, "경고", "검색 루트 폴더가 존재하지 않습니다.")
+                return
+            
+            # 확인
+            mode = "이동" if self.move_radio.isChecked() else "복사"
+            reply = QMessageBox.question(
+                self, "자동화 확인",
+                f"다음 작업을 진행하시겠습니까?\n\n"
+                f"📄 JSON 파일: {len(json_files)}개\n"
+                f"🔄 작업 모드: {mode}\n\n"
+                f"⚠️ 각 폴더 내에 분류별 서브폴더가 생성됩니다.",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # 자동화 시작
+            self.automation_json_files = json_files
+            self.automation_index = 0
+            self.is_automation_running = True
+            self.automation_results = []
+            
+            # UI 상태 변경
+            self.auto_btn.setEnabled(False)
+            self.auto_btn.setText(f"⚡ 자동화 중... (0/{len(json_files)})")
+            self.run_btn.setEnabled(False)
+            self.load_json_btn.setEnabled(False)
+            
+            self.log_text.clear()
+            self.log_text.append(f"🚀 자동화 시작: {len(json_files)}개 파일")
+            self.log_text.append("=" * 50)
+            
+            # 첫 번째 파일 처리 시작
+            self.process_next_automation_json()
+    
+    def process_next_automation_json(self):
+        """자동화 - 다음 JSON 파일 처리"""
+        if not self.is_automation_running:
+            return
+        
+        if self.automation_index >= len(self.automation_json_files):
+            # 모든 파일 처리 완료
+            self.finish_automation()
+            return
+        
+        json_file = self.automation_json_files[self.automation_index]
+        self.auto_btn.setText(f"⚡ 자동화 중... ({self.automation_index + 1}/{len(self.automation_json_files)})")
+        
+        self.log_text.append(f"\n📄 [{self.automation_index + 1}/{len(self.automation_json_files)}] {Path(json_file).name}")
+        
+        try:
+            # JSON 파일 로드
+            with open(json_file, 'r', encoding='utf-8') as f:
+                self.classification_data = json.load(f)
+            
+            self.json_path = Path(json_file)
+            self.json_path_label.setText(str(self.json_path))
+            self.json_path_label.setStyleSheet("QLabel { color: #ff6f00; padding: 5px; }")
+            
+            # 정보 표시
+            self.display_classification_info()
+            
+            # 이동 시작 (확인 없이)
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.stop_btn.setEnabled(True)
+            
+            self.mover_thread = MoverThread(
+                self.classification_data,
+                self.search_root,
+                move_mode=self.move_radio.isChecked()
+            )
+            self.mover_thread.progress.connect(self.on_progress)
+            self.mover_thread.finished.connect(self.on_automation_finished)
+            self.mover_thread.error.connect(self.on_error)
+            self.mover_thread.log.connect(self.on_log)
+            self.mover_thread.start()
+            
+        except Exception as e:
+            self.log_text.append(f"❌ JSON 로드 실패: {e}")
+            self.automation_results.append({
+                "file": Path(json_file).name,
+                "status": "error",
+                "message": str(e)
+            })
+            self.automation_index += 1
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(500, self.process_next_automation_json)
+    
+    def on_automation_finished(self, success, failed, skipped):
+        """자동화 - 개별 파일 처리 완료"""
+        self.progress_bar.setVisible(False)
+        self.stop_btn.setEnabled(False)
+        
+        # 결과 저장
+        self.automation_results.append({
+            "file": self.json_path.name if self.json_path else "Unknown",
+            "status": "success",
+            "success": success,
+            "failed": failed,
+            "skipped": skipped
+        })
+        
+        self.log_text.append(f"   ✓ 성공: {success}개 | 실패: {failed}개 | 건너뛰: {skipped}개")
+        
+        # 다음 파일 처리
+        self.automation_index += 1
+        
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(500, self.process_next_automation_json)
+    
+    def finish_automation(self):
+        """자동화 완료"""
+        self.is_automation_running = False
+        self.auto_btn.setEnabled(True)
+        self.auto_btn.setText("⚡ 자동화")
+        self.run_btn.setEnabled(True)
+        self.load_json_btn.setEnabled(True)
+        self.json_path_label.setStyleSheet("QLabel { color: #4a9eff; padding: 5px; }")
+        
+        # 결과 요약
+        total_files = len(self.automation_results)
+        success_files = sum(1 for r in self.automation_results if r["status"] == "success")
+        error_files = total_files - success_files
+        
+        total_success = sum(r.get("success", 0) for r in self.automation_results)
+        total_failed = sum(r.get("failed", 0) for r in self.automation_results)
+        total_skipped = sum(r.get("skipped", 0) for r in self.automation_results)
+        
+        self.log_text.append("\n" + "=" * 50)
+        self.log_text.append("🎉 자동화 완료!")
+        self.log_text.append(f"   📄 처리된 파일: {success_files}/{total_files}개")
+        self.log_text.append(f"   ✅ 성공: {total_success}개")
+        self.log_text.append(f"   ❌ 실패: {total_failed}개")
+        self.log_text.append(f"   ⏭️ 건너뛰: {total_skipped}개")
+        
+        QMessageBox.information(
+            self,
+            "자동화 완료",
+            f"자동화 처리가 완료되었습니다!\n\n"
+            f"📄 처리된 파일: {success_files}/{total_files}개\n"
+            f"✅ 성공: {total_success}개\n"
+            f"❌ 실패: {total_failed}개\n"
+            f"⏭️ 건너뛰: {total_skipped}개"
+        )
 
 
 def main():
