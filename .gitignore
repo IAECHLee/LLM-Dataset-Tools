@@ -6,6 +6,10 @@ models/
 output/
 tracking_results/
 
+# 데이터셋 폴더 (대용량)
+*_Dataset/
+*Dataset/
+
 # Python 캐시
 __pycache__/
 *.py[cod]
